@@ -1,121 +1,75 @@
-// Copyright © 2016 Andrew Cheung <ac1493@yp.com>
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package nvclient
 
 import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
-	"os"
+	"os/user"
 	"regexp"
 	"strings"
 
 	"github.com/lestrrat/go-libxml2"
 	"github.com/lestrrat/go-libxml2/clib"
 	"github.com/lestrrat/go-libxml2/types"
-
-	logger "github.com/atclate/go-logger"
 )
 
-/******************************************************
- * Client - interface for nventory client.
- *****************************************************/
 type Client interface {
-	GetObjects(objecttypes string, conditions Conditions, includes []string) (Result, error)
-	SetObjects(objecttypes string, conditions Conditions, includes []string, set map[string]string, login string, yes bool) (string, error)
-	GetAllSubsystemNames(objectType string) ([]string, error)
+	GetObjects(objecttypes string, conditions map[string][]string, includes map[string][]string, login string, passwordCallback func() string) (Result, error)
+	SetObjects(objecttypes string, conditions map[string][]string, includes map[string][]string, set map[string]string, login string, passwordCallback func() string) (string, error)
 }
 
-func NewNventoryClient(login string, input *bufio.Reader) *NventoryClient {
-	client := &NventoryClient{
-		username:           login,
-		Input:              input,
-		HttpClient:         NewHttpClient(),
+func NewNvClient(httpClient *http.Client, host string, passwordCallback func() string, log *Log) Client {
+	client := &NvClient{
+		server:           host,
+		httpClient:       httpClient,
+		PasswordCallback: passwordCallback,
 	}
+	client.httpClient = httpClient
+	client.logger = log
 	return client
 }
 
-type NventoryClient struct {
-	username       string
-	server         string
-	HttpClient     *HttpClient
+type NvClient struct {
+	httpClient       *http.Client
+	server           string
+	PasswordCallback func() string
+	logger           *Log
 
-	Input          *bufio.Reader
+	Input *bufio.Reader
 
+	redirflag      bool
+	numRedirects   int
 	subsystemNames []string
 }
 
-type Conditions map[string][]string
-
-func (c Conditions) GetTypes() []string {
-	keys := make([]string, 0, len(c))
-	for k := range c {
-		keys = append(keys, k)
-	}
-	return keys
+func (n *NvClient) addClient(client *http.Client) {
+	n.httpClient = client
 }
 
-func (c Conditions) GetConditionsByType(condition_type string) []string {
-	return c[condition_type]
+func (n *NvClient) getClient() *http.Client {
+	return n.httpClient
 }
 
-type Field string
-
-func (d *NventoryClient) GetServer() string {
+func (d *NvClient) GetServer() string {
 	return d.server
 }
 
-func (c *NventoryClient) SetServer(server string) {
-	c.server = server
-	c.HttpClient.SetServer(server)
-}
-
-func (f *NventoryClient) GetHttpClientFor(username string) *http.Client {
-	if f.HttpClient.httpClientMap == nil {
-		f.HttpClient.httpClientMap = make(map[string]*http.Client, 0)
-	}
-
-	httpClient := f.HttpClient.httpClientMap[username]
-	// Check if client is already initialized.
-	if httpClient == nil {
-		h, err := f.HttpClient.newHttpClientFor(username, passwordCallback)
-		if err != nil {
-			logger.Error.Printf("Unable to initialize HTTP Client: %v\n", err)
-			os.Exit(1)
-		}
-		f.HttpClient.httpClientMap[username] = h
-		return h
-	}
-	f.SetServer(f.HttpClient.GetServer())
-	return httpClient
-}
-
-func (f *NventoryClient) GetObjects(object_type string, conditions Conditions, includes []string) (Result, error) {
-	i, err := f.GetAllSubsystemNames(object_type)
+func (f *NvClient) GetObjects(object_type string, conditions map[string][]string, includes map[string][]string, login string, passwordCallback func() string) (Result, error) {
+	i, err := f.getAllSubsystemNames(object_type)
 	if err != nil {
 		return nil, err
 	}
-	includes = Intersection(i, includes)
+	includes["include"] = intersection(i, includes["include"])
 
 	u := f.getSearchUrl(object_type, conditions, includes)
-	logger.Debug.Println(fmt.Sprintf("URL: %v", u))
+	f.logger.Debug.Println(fmt.Sprintf("URL: %v", u))
 
-	resp, _ := f.GetHttpClientFor(f.username).Get(u)
+	resp, _ := f.httpClient.Get(u)
 
 	responseStr, err := readResponseBody(resp.Body)
 	if err != nil {
@@ -126,30 +80,30 @@ func (f *NventoryClient) GetObjects(object_type string, conditions Conditions, i
 	return res, err
 }
 
-func (f *NventoryClient) SetObjects(object_type string, conditions Conditions, includes []string, set map[string]string, login string, noPrompt bool) (string, error) {
-	_, err := f.GetAllSubsystemNames(object_type)
+func (f *NvClient) SetObjects(object_type string, conditions map[string][]string, includes map[string][]string, set map[string]string, login string, passwordCallback func() string) (string, error) {
+	_, err := f.getAllSubsystemNames(object_type)
 	if err != nil {
 		return "Unable to get all subsystem names.", err
 	}
 
 	u := f.getSearchUrl(object_type, conditions, includes)
-	logger.Debug.Println(fmt.Sprintf("Search URL: %v", u))
+	f.logger.Debug.Println(fmt.Sprintf("Search URL: %v", u))
 
-	resp, _ := f.GetHttpClientFor(f.username).Get(u)
+	resp, _ := f.httpClient.Get(u)
 
 	responseStr, err := readResponseBody(resp.Body)
 	if err != nil {
 		log.Fatal("Unable to read response body.")
 	}
 
-	res, err := GetResultsFromResponse(responseStr)
+	res, err := f.getResultsFromResponse(responseStr)
 
 	numSuccess := 0
 
 	switch t := res.(type) {
 	case *ResultArray:
 		if len(t.Array) > 0 {
-			con := noPrompt || PromptUserConfirmation(fmt.Sprintf("This will update %v entry, continue?  [y/N]: ", len(t.Array)), f.Input)
+			con := PromptUserConfirmation(fmt.Sprintf("This will update %v entry, continue?  [y/N]: ", len(t.Array)), f.Input)
 			if con {
 				for _, item := range t.Array {
 					switch t2 := item.(type) {
@@ -158,7 +112,7 @@ func (f *NventoryClient) SetObjects(object_type string, conditions Conditions, i
 						if idVal == nil {
 
 						} else if id, ok := idVal.(*ResultValue); ok && id.Value != "" {
-							logger.Debug.Printf("Set: %v", set)
+							f.logger.Debug.Printf("Set: %v", set)
 							values := url.Values{}
 							for k, v := range set {
 								re, err := regexp.Compile(`[.+]`)
@@ -170,23 +124,25 @@ func (f *NventoryClient) SetObjects(object_type string, conditions Conditions, i
 							}
 
 							u := f.getSetUrl(object_type, id.Value, values.Encode())
-							logger.Debug.Printf("Set URL: %v\n", u)
+							f.logger.Debug.Printf("Set URL: %v\n", u)
 
 							req, err := http.NewRequest("PUT", u, nil)
 							if err != nil {
-								logger.Error.Println("Error creating PUT request for url: " + u)
+								fmt.Println("Error creating PUT request for url: " + u)
 							} else {
-								logger.Debug.Printf("PUT Request: %v", req)
+								f.logger.Debug.Printf("PUT Request: %v", req)
+								if u, err := user.Current(); err == nil {
+									f.httpClient, err = GetHttpClientFor(f.GetServer(), u.Username, passwordCallback)
+								}
 								isRedirect := true
 								err = nil
-								client := f.GetHttpClientFor(login)
 								for isRedirect && err == nil {
-									logger.Debug.Printf("%v url: %V\n", req.Method, req.URL)
 									req, _ = http.NewRequest(req.Method, req.URL.String(), nil)
-									resp, err = client.Do(req)
+									resp, err = f.httpClient.Do(req)
+									//									f.logger.Debug.Printf("Response from %v:\n%v\n", req.URL.String(), resp)
 									isRedirect = isRedirectResponse(resp)
 									if isRedirect {
-										logger.Debug.Printf("Redirecting to %v from %v\n", getHeaderLocation(resp), req.URL.String())
+										f.logger.Debug.Printf("Redirecting to %v from %v\n", getHeaderLocation(resp), req.URL.String())
 										u, err := url.Parse(getHeaderLocation(resp))
 										if err == nil {
 											req.URL = u
@@ -195,14 +151,14 @@ func (f *NventoryClient) SetObjects(object_type string, conditions Conditions, i
 								}
 
 								if err != nil {
-									logger.Error.Printf("Error requesting PUT request for url: %v\nError: %v\n", u, err)
+									fmt.Printf("Error requesting PUT request for url: %v\nError: %v\n", u, err)
 								} else {
 									body, err := readResponseBody(resp.Body)
 									if err == nil {
-										logger.Debug.Printf("Success Response Body:\n%v\n", body)
+										f.logger.Debug.Printf("Success Response Body:\n%v\n", body)
 										numSuccess++
 									} else {
-										logger.Error.Printf("Error: %v", err)
+										fmt.Printf("Error: %v", err)
 									}
 								}
 							}
@@ -230,9 +186,9 @@ func (f *NventoryClient) SetObjects(object_type string, conditions Conditions, i
 		name = set["name"]
 	}
 
-	con := noPrompt || PromptUserConfirmation(fmt.Sprintf("This will create new entry (%v), continue?  [y/N]: ", name), f.Input)
+	con := PromptUserConfirmation(fmt.Sprintf("This will create new entry (%v), continue?  [y/N]: ", name), f.Input)
 	if con {
-		logger.Debug.Printf("Set: %v", set)
+		f.logger.Debug.Printf("Set: %v", set)
 		values := url.Values{}
 		for k, v := range set {
 			re, err := regexp.Compile(`[.+]`)
@@ -244,22 +200,25 @@ func (f *NventoryClient) SetObjects(object_type string, conditions Conditions, i
 		}
 
 		u := f.getCreateUrl(object_type, values.Encode())
-		logger.Debug.Printf("Create URL: %v\n", u)
+		f.logger.Debug.Printf("Create URL: %v\n", u)
 
 		req, err := http.NewRequest("POST", u, nil)
 		if err != nil {
-			logger.Error.Println("Error creating POST request for url: " + u)
+			fmt.Println("Error creating POST request for url: " + u)
 		} else {
-			logger.Debug.Printf("POST Request: %v", req)
+			f.logger.Debug.Printf("POST Request: %v", req)
+			if u, err := user.Current(); err == nil {
+				f.httpClient, err = GetHttpClientFor(f.GetServer(), u.Username, passwordCallback)
+			}
 			isRedirect := true
 			err = nil
 			for isRedirect && err == nil {
 				req, _ = http.NewRequest(req.Method, req.URL.String(), nil)
-				resp, err = f.GetHttpClientFor(login).Do(req)
-				logger.Debug.Printf("Response from %v:\n%v\n", req.URL.String(), resp)
+				resp, err = f.httpClient.Do(req)
+				f.logger.Debug.Printf("Response from %v:\n%v\n", req.URL.String(), resp)
 				isRedirect = isRedirectResponse(resp)
 				if isRedirect {
-					logger.Debug.Printf("Redirecting to %v from %v\n", getHeaderLocation(resp), req.URL.String())
+					f.logger.Debug.Printf("Redirecting to %v from %v\n", getHeaderLocation(resp), req.URL.String())
 					u, err := url.Parse(getHeaderLocation(resp))
 					if err == nil {
 						req.URL = u
@@ -268,11 +227,11 @@ func (f *NventoryClient) SetObjects(object_type string, conditions Conditions, i
 			}
 
 			if err != nil {
-				logger.Error.Printf("Error requesting PUT request for url: %v\nError: %v\n", u, err)
+				fmt.Printf("Error requesting PUT request for url: %v\nError: %v\n", u, err)
 			} else {
 				body, err := readResponseBody(resp.Body)
 				if err == nil {
-					logger.Debug.Printf("Success Response Body:\n%v\n", body)
+					f.logger.Debug.Printf("Success Response Body:\n%v\n", body)
 					return fmt.Sprintf("Successfully created node (%v)\n", name), err
 				} else {
 					msg := fmt.Sprintf("Error: %v", err)
@@ -297,34 +256,47 @@ func singularize(plural string) string {
 	return plural
 }
 
-func (f *NventoryClient) GetAllFields(object_type string, command map[string][]string, includes []string, flags []string) (Result, error) {
-	fields, err := f.GetAllSubsystemNames(object_type)
+func (f *NvClient) GetAllFields(object_type string, command map[string][]string, includes map[string][]string, flags []string) (Result, error) {
+	fields, err := f.getAllSubsystemNames(object_type)
 	if err != nil {
 		return nil, err
 	}
-	u := f.getSearchUrl(object_type, command, fields)
+	m := make(map[string][]string, 0)
+	m["include"] = fields
+	u := f.getSearchUrl(object_type, command, includes)
 
-	resp, _ := f.GetHttpClientFor(f.username).Get(u)
-	f.SetServer(f.HttpClient.GetServer())
+	resp, _ := f.httpClient.Get(u)
 
-	logger.Debug.Println(fmt.Sprintf("URL: %v", u))
+	f.logger.Debug.Println(fmt.Sprintf("URL: %v", u))
 
 	responseStr, err := readResponseBody(resp.Body)
 	if err != nil {
 		log.Fatal("Unable to read response body.")
 	}
 
-	return GetResultsFromResponse(responseStr)
+	return f.getResultsFromResponse(responseStr)
 }
 
-func (f *NventoryClient) GetAllSubsystemNames(objectType string) ([]string, error) {
+func intersection(allSubsystemNames []string, fields []string) []string {
+	result := make([]string, 0)
+	for _, name := range allSubsystemNames {
+		for _, inc := range fields {
+			if strings.Contains(name, inc) || strings.Contains(inc, name) {
+				result = append(result, inc)
+			}
+		}
+	}
+	return result
+}
+
+func (f *NvClient) getAllSubsystemNames(objectType string) ([]string, error) {
 	var err error
 	if len(f.subsystemNames) == 0 {
-		// query http://opsdb.wc1.example.com/nodes/field_names.xml
+		// query http://opsdb.wc1.yellowpages.com/nodes/field_names.xml
 		u := fmt.Sprintf("%v/%v/field_names.xml", f.GetServer(), objectType)
 
 		// store search_shortcuts
-		resp, err := f.GetHttpClientFor(f.username).Get(u)
+		resp, err := f.httpClient.Get(u)
 		if err != nil {
 			return f.subsystemNames, err
 		}
@@ -338,7 +310,7 @@ func (f *NventoryClient) GetAllSubsystemNames(objectType string) ([]string, erro
 	return f.subsystemNames, err
 }
 
-func (f *NventoryClient) getSubsystemNamesFromResponse(response string) ([]string, error) {
+func (f *NvClient) getSubsystemNamesFromResponse(response string) ([]string, error) {
 	ResetShortcuts()
 
 	d, err := libxml2.ParseString(response)
@@ -372,48 +344,325 @@ func (f *NventoryClient) getSubsystemNamesFromResponse(response string) ([]strin
 	return result, nil
 }
 
-func (f *NventoryClient) getSearchUrl(object_type string, searchCommand Conditions, includes []string) string {
+func (f *NvClient) getSearchUrl(object_type string, searchCommand map[string][]string, includes map[string][]string) string {
 	// start organizing commands issued
 	values := url.Values{}
 	for k, v := range searchCommand {
-		values = mergeMapOfStringArrays(values, Separate(v, k))
+		values = mergeMapOfStringArrays(values, separate(v, k))
 	}
 
-	for _, f := range includes {
-		m := make([]string, 0)
+	for k, v := range includes {
+		m := make(map[string][]string, 0)
+		for _, f := range v {
 
-		var fieldsRegex = regexp.MustCompile(`([^[]+)\[.+\]`)
-		if fieldsRegex.MatchString(f) {
-			// field[subfield]
-			fieldName := fieldsRegex.FindAllStringSubmatch(f, -1)
-			val := []string{""}
-			if strings.Contains(f, "[tags]") {
-				val = append(val, "tags")
+			var fieldsRegex = regexp.MustCompile(`([^[]+)\[.+\]`)
+			if fieldsRegex.MatchString(f) {
+				// field[subfield]
+				fieldName := fieldsRegex.FindAllStringSubmatch(f, -1)
+				val := []string{""}
+				if strings.Contains(f, "[tags]") {
+					val = append(val, "tags")
+				}
+				m[k+"["+fieldName[0][1]+"]"] = val
+			} else {
+				// field
+				m[k+"["+f+"]"] = []string{""}
 			}
-			m = append(m, fmt.Sprintf("includes[%v]=%v", fieldName[0][1], val))
-		} else {
-			// field
-			m = append(m, fmt.Sprintf("includes[%v]=", f))
 		}
+		values = mergeMapOfStringArrays(values, m)
 	}
 
 	return fmt.Sprintf("%v/%v.xml?%v", f.GetServer(), object_type, values.Encode())
 }
 
-func (f *NventoryClient) getSetUrl(object_type string, id string, query string) string {
+func (f *NvClient) getSetUrl(object_type string, id string, query string) string {
 	return fmt.Sprintf("%v/%v/%v.xml?%v", f.GetServer(), object_type, id, query)
 }
 
-func (f *NventoryClient) getCreateUrl(object_type string, query string) string {
+func (f *NvClient) getCreateUrl(object_type string, query string) string {
 	return fmt.Sprintf("%v/%v.xml?%v", f.GetServer(), object_type, query)
 }
 
-func (f *NventoryClient) getFieldValue(response string) (Result, error) {
-	return GetResultsFromResponse(response)
+func (f *NvClient) getFieldValue(response string) (Result, error) {
+	return f.getResultsFromResponse(response)
 }
 
-func (f *NventoryClient) SetAutoregPassword(pwd string) {
-	autoreg_password = pwd
+func (f *NvClient) getResultFromDom(node types.Node) (Result, error) {
+	rootChildren, err := node.ChildNodes()
+
+	if err != nil {
+		return nil, err
+	}
+
+	var isArray bool
+	var isNil bool
+	e, ok := node.(types.Element)
+	if ok {
+		attr, err := e.GetAttribute("type")
+		if err == nil && attr.Value() == "array" {
+			isArray = true
+		}
+		attr, err = e.GetAttribute("nil")
+		if err == nil && attr.Value() == "true" {
+			isNil = true
+		}
+	}
+	if isNil {
+		if isArray {
+			return nil, nil
+		}
+		return &ResultValue{Name: node.NodeName(), Value: ""}, nil
+	}
+
+	if isArray {
+		// Convert this node to array node
+		arr := &ResultArray{Array: make([]Result, 0), Name: node.NodeName()}
+		for _, n := range rootChildren {
+			switch n.NodeType() {
+			case clib.ElementNode:
+				arrChild, _ := f.getResultFromDom(n)
+				arr.Array = append(arr.Array, arrChild)
+			}
+		}
+		return arr, nil
+	}
+
+	result := &ResultMap{Name: node.NodeName()}
+	// Looping through each element in search (e.g. <node>)
+	for _, n := range rootChildren {
+		switch n.NodeType() {
+		case clib.ElementNode:
+			// traverse down to parse.
+			r, _ := f.getResultFromDom(n)
+			result.Add(n.NodeName(), r)
+		case clib.TextNode:
+			// ignore
+			if len(rootChildren) == 1 {
+				return &ResultValue{Value: n.NodeValue()}, nil
+			}
+		default:
+			f.logger.Warning.Println(fmt.Sprintf("Unknown node type!!! %v %v", n.NodeType(), n.NodeName()))
+		}
+	}
+	return result, nil
+}
+
+func (f *NvClient) getResultsFromResponse(response string) (Result, error) {
+
+	d, err := libxml2.ParseString(response)
+	if err != nil {
+		log.Fatal("Unable to parse response as xml:\n%v", response)
+	}
+
+	root, err := d.DocumentElement()
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := f.getResultFromDom(root)
+	return result, err
+}
+
+func PrintResultsFilterByFields(r Result, fields []string) string {
+	result := ""
+	if r == nil {
+		return "No matching objects\n"
+	}
+	if len(fields) == 0 {
+		// Just print the names, no fields specified
+		switch t := r.(type) {
+		case *ResultArray:
+			if len(t.Array) == 0 {
+				return "No matching objects\n"
+			}
+			for _, elm := range t.Array {
+				switch ct := elm.(type) {
+				case *ResultMap:
+					dt, ok := ct.Get("name").(*ResultValue)
+					if ok {
+						result += dt.Value + "\n"
+					} else {
+						result += ct.Name + "\n"
+					}
+				}
+			}
+		case *ResultMap:
+			result += t.Name + "\n"
+		}
+	} else {
+		// Fields specified, print name, plus fields specified.
+		// Just print the names, no fields specified
+		switch t := r.(type) {
+		case *ResultArray:
+			if len(t.Array) == 0 {
+				return "No matching objects\n"
+			}
+			for _, elm := range t.Array {
+				switch ct := elm.(type) {
+				case *ResultMap:
+					dt, ok := ct.Get("name").(*ResultValue)
+					if ok {
+						result += dt.Value + ":\n"
+					}
+					result += PrintResultsFilterByFieldsRecursive(ct, "", fields) + "\n"
+				}
+			}
+		case *ResultMap:
+			dt, ok := t.Get("name").(*ResultValue)
+			if ok {
+				result += dt.Value + "\n"
+			}
+		}
+	}
+	return result
+}
+
+func PrintResultsFilterByFieldsRecursive(r Result, parent string, fields []string) string {
+	result := ""
+	// Just print the names, no fields specified
+	switch t := r.(type) {
+	case *ResultArray:
+		if shouldPrint(parent, fields) {
+			fields = append(fields, combineName(parent, "name"))
+		}
+		for _, elm := range t.Array {
+			switch elm.(type) {
+			case *ResultArray:
+				result += PrintResultsFilterByFieldsRecursive(elm, parent, fields)
+			case *ResultMap:
+				result += PrintResultsFilterByFieldsRecursive(elm, parent, fields)
+			default:
+				result += PrintResultsFilterByFieldsRecursive(elm, parent, fields)
+			}
+		}
+	case *ResultMap:
+		for _, k := range t.GetOrder() {
+			v := t.Get(k)
+			switch ct := v.(type) {
+			case *ResultValue:
+				name := combineName(parent, k)
+				if shouldPrint(name, fields) || shouldPrint(k, fields) {
+					result += name + ": " + PrintResultsFilterByFieldsRecursive(ct, parent, fields) + "\n"
+				}
+			default:
+				name := combineName(parent, k)
+				result += PrintResultsFilterByFieldsRecursive(ct, name, fields)
+			}
+		}
+	case *ResultValue:
+		result += t.Value
+	}
+	return result
+}
+
+func combineName(parent, name string) string {
+	if len(parent) == 0 {
+		return name
+	} else {
+		return parent + "[" + name + "]"
+	}
+}
+
+func shouldPrint(name string, fields []string) bool {
+	if len(fields) == 0 {
+		return true
+	} else {
+		for _, f := range fields {
+			if !strings.Contains(name, "[") && strings.Contains(name, f) {
+				return true
+			} else if name == f {
+				return true
+			} else if f == "*" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func DebugPrintResults(r Result, parent string) string {
+	result := "(" + r.ID() + ")"
+	switch r := r.(type) {
+	case *ResultMap:
+		result = "Map: " + result
+		if len(r.GetOrder()) == 0 {
+		} else {
+			for _, k := range r.GetOrder() {
+				v := r.Get(k)
+				if v == nil {
+					result += combineName(parent, k) + ":\n"
+				} else {
+					result += DebugPrintResults(v, combineName(parent, k))
+				}
+			}
+		}
+	case *ResultArray:
+		result = "Array: " + result
+		for _, v := range r.Array {
+			result += DebugPrintResults(v, parent)
+		}
+	case *ResultValue:
+		result = "Value: " + result
+		result += parent + ": " + r.Value + "\n"
+	}
+	return result
+}
+
+func PrintResults(r Result) string {
+	result := ""
+	switch r := r.(type) {
+	case *ResultMap:
+		//result += r.Name
+		if len(r.GetOrder()) == 0 {
+			result += "\n"
+		} else {
+			result += ":\n"
+			for _, k := range r.GetOrder() {
+				v := r.Get(k)
+				result += k + ": " + PrintResultsRecursive(v, k) + "\n"
+			}
+		}
+	case *ResultArray:
+		for _, v := range r.Array {
+			m, ok := v.(*ResultMap)
+			if ok {
+				name := m.Get("name")
+				n, ok := name.(*ResultValue)
+				if ok {
+					result += n.Value + ":\n"
+				}
+			}
+			result += PrintResultsRecursive(v, "") + "\n"
+		}
+	case *ResultValue:
+		result += r.Value
+	}
+	return result
+}
+func PrintResultsRecursive(r Result, parent string) string {
+	result := ""
+	switch r := r.(type) {
+	case *ResultMap:
+		//result += r.Name
+		if len(r.GetOrder()) == 0 {
+		} else {
+			for _, k := range r.GetOrder() {
+				v := r.Get(k)
+				if v == nil {
+					result += combineName(parent, k) + ":\n"
+				} else {
+					result += PrintResultsRecursive(v, combineName(parent, k))
+				}
+			}
+		}
+	case *ResultArray:
+		for _, v := range r.Array {
+			result += PrintResultsRecursive(v, parent)
+		}
+	case *ResultValue:
+		result += parent + ": " + r.Value + "\n"
+	}
+	return result
 }
 
 func getChildFieldValue(node types.Node, parent string, fields []string) map[string]string {
@@ -473,6 +722,17 @@ func addFieldExists(field string, filter []string) bool {
 	return false
 }
 
+func mergeMapOfStringArrays(a map[string][]string, b map[string][]string) map[string][]string {
+	result := make(map[string][]string)
+	for k, v := range a {
+		result[k] = v
+	}
+	for k, v := range b {
+		result[k] = append(result[k], v...)
+	}
+	return result
+}
+
 func mergeMapOfStrings(a map[string]string, b map[string]string) map[string]string {
 	result := make(map[string]string)
 	for k, v := range a {
@@ -482,4 +742,81 @@ func mergeMapOfStrings(a map[string]string, b map[string]string) map[string]stri
 		result[k] = v
 	}
 	return result
+}
+
+func separate(hashStrings []string, prefix string) map[string][]string {
+	hash := make(map[string][]string)
+	// name[key]=value1,map[key]=value2
+	for _, val := range hashStrings {
+		values := strings.Split(val, ",")
+		// name[key]=value
+		for _, value := range values {
+			pair := strings.Split(value, "=")
+			key := ""
+			value := ""
+			if len(pair) == 2 {
+				key = fmt.Sprintf("%v%v", prefix, search_shortcuts.Replace(pair[0]))
+				value = pair[1]
+			} else if len(pair) == 1 {
+				key = "name"
+				value = pair[0]
+			} else {
+				break
+			}
+
+			hash[key] = []string{value}
+		}
+	}
+	return hash
+}
+
+func NoRedirectFunc(req *http.Request, via []*http.Request) error {
+	return errors.New("No redirect.")
+}
+
+func RedirectFunc(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	return nil
+}
+
+func isRedirectResponse(resp *http.Response) bool {
+	if resp == nil {
+		return false
+	}
+	return isRedirect(resp.StatusCode)
+}
+
+func isRedirect(returnCode int) bool {
+	if returnCode >= 300 && returnCode < 400 {
+		return true
+	}
+	return false
+}
+
+func handleResponseError(err error) error {
+	// return true - error happened
+	// false - no error
+	if strings.Contains(fmt.Sprintf("%v", err), "No redirect.") {
+		// If we're redirected only, return nil
+		return nil
+	}
+	return err
+}
+
+func getHeaderLocation(resp *http.Response) string {
+	if resp != nil && resp.Header["Location"] != nil {
+		return resp.Header["Location"][0]
+	}
+	return ""
+}
+
+func readResponseBody(body io.ReadCloser) (string, error) {
+	//defer body.Close()
+	contents, err := ioutil.ReadAll(body)
+	if err != nil {
+		return "", err
+	}
+	return string(contents), nil
 }
